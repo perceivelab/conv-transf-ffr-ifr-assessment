@@ -1,5 +1,3 @@
-# ffr-angio-3D
-
 <div align="center">
 
 # A Hybrid Convolutional-Transformer Model for FFR and iFR Assessment from Angiography Data
