@@ -1,8 +1,7 @@
 <div align="center">
 
 # A Hybrid Convolutional-Transformer Model for FFR and iFR Assessment from Angiography Data
-Raffaele Mineo, Federica Proietto Salanitri, Ovidio De Filippo, Michele Millesimo, Gaetano Maria De Ferrari, Marco Aldinucci, Daniela
-Giordano, Fabrizio D’Ascenzo, Simone Palazzo, Concetto Spampinato
+R. Mineo, F. Proietto Salanitri, G. Bellitto, I. Kavasidis, O. De Filippo, M. Millesimo, G. M. De Ferrari, M. Aldinucci, D. Giordano, S. Palazzo, F. D'Ascenzo and C. Spampinato
 
 <!---[![Paper](http://img.shields.io/badge/paper-arxiv.2206.10048-B31B1B.svg)]()-->
 [![cvf](https://img.shields.io/badge/IEEE%20TNNLS_2024-_-darkgreen?style=flat-square)](https://ieeexplore.ieee.org/abstract/document/10582501)
