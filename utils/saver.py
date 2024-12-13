@@ -14,6 +14,7 @@ import socket
 import threading
 import webbrowser
 from matplotlib import pyplot as plt
+from matplotlib import figure as fgr
 import numpy as np
 
 class Saver(object):
@@ -63,22 +64,8 @@ class Saver(object):
             f.write(cmd_args)
             f.write('\n')
 
-    @staticmethod
-    def start_tensorboard_daemon(path, tensorboard_port):
-        # Start TensorBoard Daemon to visualize data
-        i = 0
-        while(True):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                i += 1
-                if s.connect_ex(('localhost', tensorboard_port)) == 0: # check if port is busy
-                    tensorboard_port = tensorboard_port + 1
-                else:
-                    break
-                if i > 100:
-                    raise RuntimeError('Can not find free port at +100 from your chosen port!')
-        t = threading.Thread(target=lambda: os.system('tensorboard --logdir=' + str(path) + ' --port=' + str(tensorboard_port)))
-        t.start()
-        webbrowser.open('http://localhost:' + str(tensorboard_port) + '/', new=1)
+    def close(self):
+        self.writer.close()
     
     def save_model(self, net: torch.nn.Module, name: str, epoch: int):
         """
@@ -92,7 +79,7 @@ class Saver(object):
         # Save
         torch.save(state_dict, str(self.ckpt_path) + '/' + f'{name}_{epoch:05d}.pth')
 
-    def save_checkpoint(self, net: torch.nn.Module, stats: dict, name: str, epoch: int):
+    def save_model_stats(self, net: torch.nn.Module, stats: dict, name: str, epoch: int):
         """
         Save model parameters and stats in the checkpoint directory.
         """
@@ -104,57 +91,37 @@ class Saver(object):
         # Save
         torch.save({'state_dict':state_dict,'stats':stats}, self.ckpt_path / f'{name}_{epoch:05d}.pth')
 
-    def dump_line(self, line, step, split, name, fmt=''):
-        """
-        Dump line as matplotlib figure into folder and tb
+    def save_figure(self, figure_data_array: dict, step, split, filename: str):
+        ''' Save figure data array in experiment folder '''
+        out_path = self.output_path[split] / f'{filename}_{step:05d}.pt'
+        torch.save(figure_data_array, out_path)
 
-        """
-        assert split in self.sub_dirs
-        # Plot line
-        fig = plt.figure()
-        if isinstance(line, tuple):
-            line_x, line_y = line
-            plt.plot(line_x.cpu().detach().numpy(), line_y.cpu().detach().numpy(), fmt)
-        else:
-            plt.plot(line.cpu().detach().numpy(), fmt)
-        out_path = self.output_path[split] / f'line_{step:08d}_{name}.jpg'
-        plt.savefig(out_path)
-        self.writer.add_figure(f'{split}/{name}', fig, step)
-
-    def dump_histogram(self, tensor: torch.Tensor, epoch: int, desc: str):
-        try:
-            self.writer.add_histogram(desc, tensor.contiguous().view(-1), epoch)
-        except:
-            print('Error writing histogram')
-    
-    def dump_metric(self, value: float, epoch: int, *tags):
-        self.writer.add_scalar('/'.join(tags), value, epoch)
-
-    def save_data(self,data,name:str):
-        ''' Save generic data in experiment folder '''
-        torch.save(data, self.path / f'{name}.pth')
+    def save_image(self, tensor_img: torch.Tensor, step, split, filename: str):
+        ''' Save image from tensor to file '''
+        out_path = self.output_path[split] / f'{filename}_{step:05d}.png'
+        torchvision.utils.save_image(tensor_img.cpu(), out_path, normalize=True)
 
     def log_scalar(self, name: str, value: float, iter_n: int):
         '''
-        Log loss to TB and comet_ml
+        Log scalar to Tensorboard
         '''
         self.writer.add_scalar(name, value, iter_n)
 
-    def log_images(self, name: str, images_vector: torch.Tensor, iter_n: int, split, filename, save_file):
+    def log_figure(self, name: str, figure_obj: fgr.Figure, iter_n: int):
+        '''
+        Log figure to Tensorboard
+        '''
+        self.writer.add_figure(name, figure_obj, iter_n)
+        
+        plt.close(figure_obj)
+
+    def log_images(self, name: str, images_vector: torch.Tensor, iter_n: int):
         '''
         Log images to Tensorboard
         image_vector.shape = (CH,M,N)
         '''
         img_grid = torchvision.utils.make_grid(images_vector.unsqueeze(0), normalize=True, nrow=10)
         self.writer.add_image(name, img_grid, iter_n)
-        #pil_img = transforms.ToPILImage()(img_grid.cpu())
-        if save_file:
-            self.save_image(img_grid, filename, split, iter_n)
-
-    def save_image(self, tensor_img: torch.Tensor, filename: str, split, step):
-        ''' Save image from tensor to file '''
-        out_path = self.output_path[split] / f'{filename}_{step:05d}.png'
-        torchvision.utils.save_image(tensor_img.cpu(), out_path, normalize=True)
 
     @staticmethod
     def load_hyperparams(hyperparams_path):
@@ -167,6 +134,8 @@ class Saver(object):
             raise OSError('Please provide a valid checkpoints path')
         if hyperparams_path.is_dir():
             hyperparams_path = os.path.join(hyperparams_path, 'hyperparams.txt')
+        else:
+            hyperparams_path = os.path.join(hyperparams_path.parent.parent, 'hyperparams.txt')
         # Prepare output
         output = {}
         # Read file
@@ -264,59 +233,79 @@ class Saver(object):
         else:
             return torch.load(checkpoint)['state_dict']
 
-    def saveLogsError(self, true_labels_in, predicted_labels_in, predicted_scores_in, dict_other_info_in, split, epoch):
+    @staticmethod
+    def saveLogsError(filename, true_labels_in, predicted_labels_in, predicted_scores_in, dict_other_info_in, split, epoch, txt_file=False):
         true_labels, predicted_labels, predicted_scores = np.array(true_labels_in), np.array(predicted_labels_in), np.array(predicted_scores_in)
         dict_other_info = {key:np.array(dict_other_info_in[key]) for key in dict_other_info_in}
 
         mask_error = true_labels!=predicted_labels
-
-        if (len(predicted_scores[mask_error]) > 0):
-            if (len(predicted_scores[mask_error][0]) != 2):
-                raise RuntimeError("Correct len of predicted_score's list in the file1.write (a few lines below in this code).")
-
-        with open(self.output_path[split] / f'errors_{epoch:05d}.txt', "w") as file1:
-            file1.write("true_label;predicted_label;predicted_score")
-            for x in dict_other_info:
-                file1.write(";")
-                file1.write(str(x))
-            file1.write("\n")
-
-            for i in range(len(true_labels[mask_error])):
-                file1.write(str(true_labels[mask_error][i]))
-                file1.write(";")
-                file1.write(str(predicted_labels[mask_error][i]))
-                file1.write(";")
-                file1.write("[" + str(predicted_scores[mask_error][i][0]) + "," + str(predicted_scores[mask_error][i][1]) + "]")
-                for x in dict_other_info:
-                    file1.write(";")
-                    file1.write(str(dict_other_info[x][mask_error][i]))
-                file1.write("\n")
+        
+        Saver.saveLogs(filename, true_labels[mask_error], predicted_labels[mask_error], predicted_scores[mask_error], {k: dict_other_info[k][mask_error] for k in dict_other_info}, split, epoch, txt_file)
     
     @staticmethod
-    def saveLogs(logdir, true_labels_in, predicted_labels_in, predicted_scores_in, dict_other_info_in, split, epoch):
+    def saveLogs(filename, true_labels_in, predicted_labels_in, predicted_scores_in, dict_other_info_in, split, epoch, txt_file=False):
         true_labels, predicted_labels, predicted_scores = np.array(true_labels_in), np.array(predicted_labels_in), np.array(predicted_scores_in)
-        dict_other_info = {key:np.array(dict_other_info_in[key]) for key in dict_other_info_in}
+        dict_other_info = {key: np.array(dict_other_info_in[key]) for key in dict_other_info_in}
 
-        if (len(predicted_scores[0]) != 2):
-            raise RuntimeError("Correct len of predicted_score's list in the file1.write (a few lines below in this code).")
-
-        with open(logdir + f'/{split}_logs_{epoch:05d}.txt', "w") as file1:
-            file1.write("true_label;predicted_label;predicted_score")
-            for x in dict_other_info:
-                file1.write(";")
-                file1.write(str(x))
-            file1.write("\n")
-
-            for i in range(len(true_labels)):
-                file1.write(str(true_labels[i]))
-                file1.write(";")
-                file1.write(str(predicted_labels[i]))
-                file1.write(";")
-                file1.write("[" + str(predicted_scores[i][0]) + "," + str(predicted_scores[i][1]) + "]")
+        if txt_file:
+            with open(str(filename)+'.txt', "w") as file1:
+                file1.write("true_label;predicted_label;predicted_scores")
                 for x in dict_other_info:
                     file1.write(";")
-                    file1.write(str(dict_other_info[x][i]))
+                    file1.write(str(x))
                 file1.write("\n")
+            
+                for i in range(len(true_labels)):
+                    file1.write(str(true_labels[i]))
+                    file1.write(";")
+                    file1.write(str(predicted_labels[i]))
+                    file1.write(";")
+                    file1.write(str(predicted_scores[i]))
+                    for x in dict_other_info:
+                        file1.write(";")
+                        file1.write(str(dict_other_info[x][i]))
+                    file1.write("\n")
+        else:
+            dict_save= {
+                'epoch': epoch,
+                'split': split,
+                'true_labels': true_labels,
+                'predicted_labels': predicted_labels,
+            }
+            
+            for k in dict_other_info:
+                dict_save[k] = dict_other_info[k]
+            
+            torch.save(dict_save, str(filename)+'.pt')
+        
+    @staticmethod
+    def saveMetrics(filename, dict_general_info_in, split, epoch, txt_file=False):
+        dict_general_info = {key: np.array(dict_general_info_in[key]) for key in dict_general_info_in}
+
+        if txt_file:
+            with open(str(filename)+'.txt', "w") as file1:
+                file1.write("epoch;split")
+                for x in dict_general_info:
+                    file1.write(";")
+                    file1.write(str(x))
+                file1.write("\n")
+            
+                file1.write(str(epoch))
+                file1.write(";")
+                file1.write(split)
+                for x in dict_general_info:
+                    file1.write(";")
+                    file1.write(str(dict_general_info[x]))
+        else:
+            dict_save= {
+                'epoch': epoch,
+                'split': split,
+            }
+            
+            for k in dict_general_info:
+                dict_save[k] = dict_general_info[k]
+            
+            torch.save(dict_save, str(filename)+'.pt')
     
     @staticmethod
     def printLogsError(true_labels_in, predicted_labels_in, predicted_scores_in, dict_other_info_in, split, epoch):
@@ -330,5 +319,19 @@ class Saver(object):
         for i in range(len(true_labels[mask_error])):
             print(str(true_labels[mask_error][i]), str(predicted_labels[mask_error][i]), str(predicted_scores[mask_error][i]), *(str(dict_other_info[x][mask_error][i]) for x in dict_other_info), sep=';')
 
-    def close(self):
-        self.writer.close()
+    @staticmethod
+    def start_tensorboard_daemon(path, tensorboard_port):
+        # Start TensorBoard Daemon to visualize data
+        i = 0
+        while(True):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                i += 1
+                if s.connect_ex(('localhost', tensorboard_port)) == 0: # check if port is busy
+                    tensorboard_port = tensorboard_port + 1
+                else:
+                    break
+                if i > 100:
+                    raise RuntimeError('Can not find free port at +100 from your chosen port!')
+        t = threading.Thread(target=lambda: os.system('tensorboard --logdir=' + str(path) + ' --port=' + str(tensorboard_port)))
+        t.start()
+        webbrowser.open('http://localhost:' + str(tensorboard_port) + '/', new=1)

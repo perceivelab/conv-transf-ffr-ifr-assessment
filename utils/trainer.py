@@ -6,10 +6,14 @@ from utils import utils
 
 class Trainer:
     ''' Class to train the classifier '''
-    def __init__(self, net, class_weights, optim, enable_multibranch_ffr, enable_multibranch_ifr, multibranch_loss_weight, scaler=None):
+    def __init__(self, net, class_weights, optim, gradient_clipping_value, enable_multibranch_ffr, enable_multibranch_ifr, multibranch_loss_weight, enable_clinicalData, doubleViewInput, input3d, input2d, scaler=None):
         self.enable_multibranch_ffr = enable_multibranch_ffr
         self.enable_multibranch_ifr = enable_multibranch_ifr
         self.multibranch_loss_weight = multibranch_loss_weight
+        self.enable_clinicalData = enable_clinicalData
+        self.doubleViewInput = doubleViewInput
+        self.input3d = input3d
+        self.input2d = input2d
         # Store model
         self.net = net
         # Store optimizer
@@ -17,13 +21,15 @@ class Trainer:
         # Create Loss
         self.criterion_label = nn.CrossEntropyLoss(weight = class_weights)
         if self.enable_multibranch_ffr:
-            self.criterion_ffr = nn.L1Loss(reduction='sum') # reduction='sum' - pay attention to balance total loss in relation of batch size
+            self.criterion_ffr = nn.L1Loss(reduction='sum') # MSELoss # reduction='sum' - pay attention to balance total loss in relation of batch size
         if self.enable_multibranch_ifr:
-            self.criterion_ifr = nn.L1Loss(reduction='sum') # reduction='sum' - pay attention to balance total loss in relation of batch size
+            self.criterion_ifr = nn.L1Loss(reduction='sum') # MSELoss # reduction='sum' - pay attention to balance total loss in relation of batch size
+        # Gradient clipping
+        self.gradient_clipping_value = gradient_clipping_value
         # CUDA AMP
         self.scaler = scaler
 
-    def forward_batch(self, imgs_3d, labels, FFRs, iFRs, split):
+    def forward_batch(self, imgs_3d, imgs_2d, labels, FFRs, iFRs, clinicalData, doubleView_3d, doubleView_2d, split):
         ''' send a batch to net and backpropagate '''
         def forward_batch_part():
             # Set network mode
@@ -36,7 +42,46 @@ class Trainer:
             
             if self.scaler is None:
                 # foward pass
-                out = self.net(imgs_3d)
+                if self.doubleViewInput:
+                    if self.enable_clinicalData:
+                        if self.input3d and self.input2d:
+                            inputs = imgs_3d, doubleView_3d, clinicalData, imgs_2d, doubleView_2d
+                        elif self.input3d:
+                            inputs = imgs_3d, doubleView_3d, clinicalData
+                        elif self.input2d:
+                            inputs = imgs_2d, doubleView_2d, clinicalData
+                        else:
+                            raise RuntimeError("No input.")
+                    else:
+                        if self.input3d and self.input2d:
+                            inputs = imgs_3d, doubleView_3d, imgs_2d, doubleView_2d
+                        elif self.input3d:
+                            inputs = imgs_3d, doubleView_3d
+                        elif self.input2d:
+                            inputs = imgs_2d, doubleView_2d
+                        else:
+                            raise RuntimeError("No input.")
+                else:
+                    if self.enable_clinicalData:
+                        if self.input3d and self.input2d:
+                            inputs = imgs_3d, clinicalData, imgs_2d
+                        elif self.input3d:
+                            inputs = imgs_3d, clinicalData
+                        elif self.input2d:
+                            inputs = imgs_2d, clinicalData
+                        else:
+                            inputs = clinicalData
+                    else:
+                        if self.input3d and self.input2d:
+                            inputs = imgs_3d, imgs_2d
+                        elif self.input3d:
+                            inputs = imgs_3d
+                        elif self.input2d:
+                            inputs = imgs_2d
+                        else:
+                            raise RuntimeError("No input.")
+                
+                out = self.net(inputs)
                 
                 if self.enable_multibranch_ffr and self.enable_multibranch_ifr:
                     predicted_labels_logits, predicted_FFRs, predicted_iFRs = out
@@ -82,7 +127,46 @@ class Trainer:
             else:
                 with torch.cuda.amp.autocast():
                     # foward pass
-                    out = self.net(imgs_3d)
+                    if self.doubleViewInput:
+                        if self.enable_clinicalData:
+                            if self.input3d and self.input2d:
+                                inputs = imgs_3d, doubleView_3d, clinicalData, imgs_2d, doubleView_2d
+                            elif self.input3d:
+                                inputs = imgs_3d, doubleView_3d, clinicalData
+                            elif self.input2d:
+                                inputs = imgs_2d, doubleView_2d, clinicalData
+                            else:
+                                raise RuntimeError("No input.")
+                        else:
+                            if self.input3d and self.input2d:
+                                inputs = imgs_3d, doubleView_3d, imgs_2d, doubleView_2d
+                            elif self.input3d:
+                                inputs = imgs_3d, doubleView_3d
+                            elif self.input2d:
+                                inputs = imgs_2d, doubleView_2d
+                            else:
+                                raise RuntimeError("No input.")
+                    else:
+                        if self.enable_clinicalData:
+                            if self.input3d and self.input2d:
+                                inputs = imgs_3d, clinicalData, imgs_2d
+                            elif self.input3d:
+                                inputs = imgs_3d, clinicalData
+                            elif self.input2d:
+                                inputs = imgs_2d, clinicalData
+                            else:
+                                inputs = clinicalData
+                        else:
+                            if self.input3d and self.input2d:
+                                inputs = imgs_3d, imgs_2d
+                            elif self.input3d:
+                                inputs = imgs_3d
+                            elif self.input2d:
+                                inputs = imgs_2d
+                            else:
+                                raise RuntimeError("No input.")
+                    
+                    out = self.net(inputs)
 
                     if self.enable_multibranch_ffr and self.enable_multibranch_ifr:
                         predicted_labels_logits, predicted_FFRs, predicted_iFRs = out
@@ -139,7 +223,14 @@ class Trainer:
                     loss.backward()
                 else:
                     self.scaler.scale(loss).backward()
-            
+                
+                # gradient clipping
+                if self.gradient_clipping_value > 0:
+                    if self.scaler is None:
+                        torch.nn.utils.clip_grad_value_(self.net.parameters(), self.gradient_clipping_value)
+                    else:
+                        self.scaler.unscale_(self.optim)
+                        torch.nn.utils.clip_grad_value_(self.net.parameters(), self.gradient_clipping_value)
             if self.enable_multibranch_ffr and self.enable_multibranch_ifr:
                 return loss, predicted_labels, predicted_scores, loss_labels, loss_FFRs, loss_iFRs, predicted_FFRs, predicted_iFRs
             elif self.enable_multibranch_ffr:
@@ -197,7 +288,7 @@ class Trainer:
 
         return metrics, predicted
 
-    def forward_batch_testing(net, imgs_3d, FFRs, iFRs, enable_multibranch_ffr, enable_multibranch_ifr, scaler=None):
+    def forward_batch_testing(net, imgs_3d, imgs_2d, FFRs, iFRs, clinicalData, doubleView_3d, doubleView_2d, enable_multibranch_ffr, enable_multibranch_ifr, enable_clinicalData, doubleViewInput, input3d, input2d, scaler=None):
         ''' send a batch to net and backpropagate '''
         # Set network mode
         net.eval()
@@ -205,7 +296,46 @@ class Trainer:
         
         if scaler is None:
             # foward pass
-            out = net(imgs_3d)
+            if doubleViewInput:
+                if enable_clinicalData:
+                    if input3d and input2d:
+                        inputs = imgs_3d, doubleView_3d, clinicalData, imgs_2d, doubleView_2d
+                    elif input3d:
+                        inputs = imgs_3d, doubleView_3d, clinicalData
+                    elif input2d:
+                        inputs = imgs_2d, doubleView_2d, clinicalData
+                    else:
+                        raise RuntimeError("No input.")
+                else:
+                    if input3d and input2d:
+                        inputs = imgs_3d, doubleView_3d, imgs_2d, doubleView_2d
+                    elif input3d:
+                        inputs = imgs_3d, doubleView_3d
+                    elif input2d:
+                        inputs = imgs_2d, doubleView_2d
+                    else:
+                        raise RuntimeError("No input.")
+            else:
+                if enable_clinicalData:
+                    if input3d and input2d:
+                        inputs = imgs_3d, clinicalData, imgs_2d
+                    elif input3d:
+                        inputs = imgs_3d, clinicalData
+                    elif input2d:
+                        inputs = imgs_2d, clinicalData
+                    else:
+                        raise RuntimeError("No input.")
+                else:
+                    if input3d and input2d:
+                        inputs = imgs_3d, imgs_2d
+                    elif input3d:
+                        inputs = imgs_3d
+                    elif input2d:
+                        inputs = imgs_2d
+                    else:
+                        raise RuntimeError("No input.")
+            
+            out = net(inputs)
 
             if enable_multibranch_ffr and enable_multibranch_ifr:
                     predicted_labels_logits, predicted_FFRs, predicted_iFRs = out
@@ -230,7 +360,45 @@ class Trainer:
         else:
             with torch.cuda.amp.autocast():
                 # foward pass
-                out = net(imgs_3d)
+                if doubleViewInput:
+                    if enable_clinicalData:
+                        if input3d and input2d:
+                            inputs = imgs_3d, doubleView_3d, clinicalData, imgs_2d, doubleView_2d
+                        elif input3d:
+                            inputs = imgs_3d, doubleView_3d, clinicalData
+                        elif input2d:
+                            inputs = imgs_2d, doubleView_2d, clinicalData
+                        else:
+                            raise RuntimeError("No input.")
+                    else:
+                        if input3d and input2d:
+                            inputs = imgs_3d, doubleView_3d, imgs_2d, doubleView_2d
+                        elif input3d:
+                            inputs = imgs_3d, doubleView_3d
+                        elif input2d:
+                            inputs = imgs_2d, doubleView_2d
+                        else:
+                            raise RuntimeError("No input.")
+                else:
+                    if enable_clinicalData:
+                        if input3d and input2d:
+                            inputs = imgs_3d, clinicalData, imgs_2d
+                        elif input3d:
+                            inputs = imgs_3d, clinicalData
+                        elif input2d:
+                            inputs = imgs_2d, clinicalData
+                        else:
+                            raise RuntimeError("No input.")
+                    else:
+                        if input3d and input2d:
+                            inputs = imgs_3d, imgs_2d
+                        elif input3d:
+                            inputs = imgs_3d
+                        elif input2d:
+                            inputs = imgs_2d
+                        else:
+                            raise RuntimeError("No input.")
+                out = net(inputs)
                 if enable_multibranch_ffr and enable_multibranch_ifr:
                     predicted_labels_logits, predicted_FFRs, predicted_iFRs = out
                 elif enable_multibranch_ffr:

@@ -4,12 +4,13 @@ os.environ['FOR_DISABLE_CONSOLE_CTRL_HANDLER'] = '1'
 import argparse
 from tqdm import tqdm
 from utils.dataset import get_loader
-from utils.models.models import get_model
+from utils.models.models_old import get_model
 from utils.trainer import Trainer
 from utils.saver import Saver
 from utils import utils
 import torch
 import GPUtil
+import platform
 
 # Graph visualization on browser
 import socket
@@ -30,12 +31,15 @@ import webbrowser
 import scipy
 import PIL
 import io
+from pathlib import Path
 from medcam import medcam
 from medcam.backends import base as medcam_backends_base
 from captum.attr import LayerAttribution
+#torch.backends.cudnn.enabled = False # if RNN explainability
+#import numpy as np
 
 # Explainability pytorch-gradcam-book
-from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam import GradCAM, HiResCAM, GradCAMElementWise, GradCAMPlusPlus, XGradCAM, AblationCAM, ScoreCAM, EigenCAM, EigenGradCAM, LayerCAM, FullGrad, DeepFeatureFactorization
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
 import cv2
@@ -44,7 +48,9 @@ def parse():
     '''Returns args passed to the train.py script.'''
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch_size', type=int, help='batch size', default=4)
-    parser.add_argument('--logdir', type=str, help='path for choosing best checkpoint')
+    parser.add_argument('--logdir', type=str, help='path for choosing best checkpoint', default='D:\\ffr\\ffr-angio-3d\\25-ablation_studies\\2022-12-20_15-53-02_resnet3d_pretrained')
+    parser.add_argument('--split_path', type=Path, help="if not None, override checkpoint's json dataset metadata for MONAI", default=None)
+    parser.add_argument('--num_fold', type=int, help="if not None, override checkpoint's test fold for nested cross-validation", default=None)
     parser.add_argument('--cache_rate', type=float, help='fraction of dataset to be cached in RAM [0.0-1.0]', default=0.0)
     parser.add_argument('--start_tensorboard_server', type=bool, help='start tensorboard server', default=False)
     parser.add_argument('--tensorboard_port', type=int, help='if starting tensorboard server, port (if unavailable, try the next ones)', default=6006)
@@ -82,9 +88,13 @@ def main():
     # Load configuration
     args = parse()
 
-    # Check logdir if is a dir
+    # Check logdir if is a dir/file
+    if not os.path.exists(args.logdir):
+        raise EnvironmentError(args.logdir, 'logdir must be an existing dir/file.')
+    
     if not os.path.isdir(args.logdir):
-        raise EnvironmentError('logdir must be an existing dir.')
+        args.logdir_file = args.logdir
+        args.logdir = Path(args.logdir).parent.parent
     
     # Check/Mod batch_size
     if args.enable_explainability:
@@ -93,12 +103,19 @@ def main():
         args.batch_size = 1 # mandatory 1 if explainability
     
     # Load hyperparameters
-    args2 = Saver.load_hyperparams(args.logdir)
+    args_checkpoint = Saver.load_hyperparams(args.logdir)
     args = vars(args)
+    
+    if args['split_path'] is None:
+        del args['split_path']
+    if args['num_fold'] is None:
+        del args['num_fold']
+    
+    # Misc args
     for key in args:
-        if key in args2:
-            del args2[key]
-    args.update(args2)
+        if key in args_checkpoint:
+            del args_checkpoint[key]
+    args.update(args_checkpoint)
     args = argparse.Namespace(**args)
 
     # Choose device
@@ -113,13 +130,13 @@ def main():
         else:
             raise RuntimeError("Can't use distributed mode! Check if you don't run correct command: 'python -m torch.distributed.launch --nproc_per_node=num_gpus --use_env test.py'")
         torch.cuda.set_device(args.gpu)
-        args.dist_backend = 'gloo'
-        print('| distributed init (rank {}): {}'.format(args.rank, args.dist_url), flush=True)
+        args.dist_backend = 'gloo' if ((platform.system() == 'Windows') or (args.device == 'cpu')) else 'nccl'
+        print('| ' + args.dist_backend + ': distributed init (rank {}): {}'.format(args.rank, args.dist_url), flush=True)
         torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=args.world_size, rank=args.rank)
         torch.distributed.barrier()
         device = torch.device(args.gpu)
-        # disable printing when not in master process
-        __builtin__.print = print_mod
+        #if args.rank != 0:
+        #    __builtin__.print = no_print
     else:
         if args.device == 'cuda': # choose the most free gpu
             #mem = [(torch.cuda.memory_allocated(i)+torch.cuda.memory_reserved(i)) for i in range(torch.cuda.device_count())]
@@ -137,9 +154,7 @@ def main():
 
     # Dataset e Loader
     print("Dataset: balanced nested cross-validation use fold (test-set) " + str(args.num_fold) + " and inner_loop (validation-set) " + str(args.inner_loop) + ".")
-    loaders, samplers, loss_weights = get_loader(args)
-    del loaders['train']
-    del loaders['validation']
+    loaders, samplers, loss_weights = get_loader(args, only_test=True)
 
     # Model
     model = get_model(num_classes=2,
@@ -147,13 +162,34 @@ def main():
                         enable_multibranch_ffr=args.enable_multibranch_ffr,
                         enable_multibranch_ifr=args.enable_multibranch_ifr,
                         multibranch_dropout=args.multibranch_dropout,
+                        enable_clinicalData=args.enable_clinicalData,
+                        in_dim_clinicalData=args.len_clinicalData if args.enable_clinicalData else None,
+                        enable_doubleView=args.enable_doubleView,
+                        enable_keyframe=(args.dataset3d and args.dataset2d),
+                        reduceInChannel=args.reduceInChannel,
+                        freezeBackbone=args.freezeBackbone,
+                        enableNonLocalBlock = args.enableNonLocalBlock,
+                        enableTemporalNonLocalBlock = args.enableTemporalNonLocalBlock,
+                        enableSpatioTemporalNonLocalBlock = args.enableSpatioTemporalNonLocalBlock,
+                        numNonLocalBlock= args.numNonLocalBlock,
                         enableGlobalMultiHeadAttention=args.enableGlobalMultiHeadAttention,
                         enableTemporalMultiHeadAttention=args.enableTemporalMultiHeadAttention,
+                        numHeadMultiHeadAttention=args.numHeadMultiHeadAttention,
+                        enableTemporalGru=args.enableTemporalGru,
+                        numLayerGru=args.numLayerGru,
+                        enableTemporalLstm=args.enableTemporalLstm,
+                        numLayerLstm=args.numLayerLstm,
+                        enableGlobalTransformerEncoder=args.enableGlobalTransformerEncoder,
                         enableSpatialTemporalTransformerEncoder=args.enableSpatialTemporalTransformerEncoder,
                         numLayerTransformerEncoder=args.numLayerTransformerEncoder,
-                        numHeadMultiHeadAttention=args.numHeadMultiHeadAttention,
-                        loss_weights=loss_weights)
-    checkpoint, epoch = Saver.load_model(args.logdir, return_epoch=True)
+                        numHeadGlobalTransformer=args.numHeadGlobalTransformer,
+                        numHeadSpatialTransformer=args.numHeadSpatialTransformer,
+                        numHeadTemporalTransformer=args.numHeadTemporalTransformer,
+                        transformerNormFirst=args.transformerNormFirst,
+                        loss_weights=loss_weights,
+                        batch_size=args.batch_size,
+                        input_size=args.pad)
+    checkpoint, epoch = Saver.load_model(args.logdir_file, return_epoch=True)
     model.load_state_dict(checkpoint, strict=True)
     model.to(device)
 
@@ -237,8 +273,12 @@ def main():
         data_loader = loaders[split]
 
         if args.enable_explainability:
-            tot_images_3d = []
-            tot_images_3d_gradient = []
+            if args.dataset3d:
+                tot_images_3d = []
+                tot_images_3d_gradient = []
+            if args.dataset2d:
+                tot_images_2d = []
+                tot_images_2d_gradient = []
         tot_true_labels = []
         tot_true_FFRs = []
         tot_true_iFRs = []
@@ -252,20 +292,53 @@ def main():
         for batch in tqdm(data_loader, desc=f'{split}'):
             labels, image_paths, FFRs, iFRs = batch['label'], batch['image'], batch['FFR'], batch['iFR']
             
-            images_3d = batch['image_3d']
+            images_3d = None
+            doubleView_3d = None
+            if args.dataset3d:
+                images_3d = batch['image_3d']
+                if args.doubleViewInput:
+                    doubleView_3d = batch['image2_3d']
+
+            images_2d = None
+            doubleView_2d = None
+            if args.dataset2d:
+                images_2d = batch['image_2d']
+                if args.doubleViewInput:
+                    doubleView_2d = batch['image2_2d']
             
+            clinicalData = None
+            if args.enable_clinicalData:
+                clinicalData = torch.cat((batch['age_array'], batch['sex'].unsqueeze(1), batch['ckd'].unsqueeze(1), batch['ef_array'], batch['stemi'].unsqueeze(1), batch['nstemi'].unsqueeze(1), batch['ua'].unsqueeze(1), batch['stable_angima'].unsqueeze(1), batch['positive_stress_test'].unsqueeze(1)), dim=1)
+
             if args.enable_explainability:
-                tot_images_3d.extend(images_3d.tolist())
+                if args.dataset3d:
+                    tot_images_3d.extend(images_3d.tolist())
+                if args.dataset2d:
+                    tot_images_2d.extend(images_2d.tolist())
             tot_true_labels.extend(labels.tolist())
             tot_image_paths.extend(image_paths)
             tot_true_FFRs.extend(FFRs.tolist())
             tot_true_iFRs.extend(iFRs.tolist())
 
-            images_3d = images_3d.to(device)
+            if args.dataset3d:
+                images_3d = images_3d.to(device)
+                if args.doubleViewInput:
+                    doubleView_3d = doubleView_3d.to(device)
+            if args.dataset2d:
+                images_2d = images_2d.to(device)
+                if args.doubleViewInput:
+                    doubleView_2d = doubleView_2d.to(device)
+            
+            if args.enable_clinicalData:
+                clinicalData = clinicalData.to(device)
 
             if args.enable_explainability:
-                images_3d_clone = images_3d.clone().detach()
-                images_3d_clone = images_3d_clone.to(device)
+                if args.dataset3d:
+                    images_3d_clone = images_3d.clone().detach()
+                    images_3d_clone = images_3d_clone.to(device)
+                if args.dataset2d:
+                    images_2d_clone = images_2d.clone().detach()
+                    images_2d_clone = images_2d_clone.to(device)
 
             labels = labels.to(device)
             FFRs = FFRs.to(device)
@@ -273,10 +346,18 @@ def main():
             
             returned_values = Trainer.forward_batch_testing(net=model,
                                                             imgs_3d=images_3d,
+                                                            imgs_2d=images_2d,
                                                             FFRs=FFRs,
                                                             iFRs=iFRs,
+                                                            clinicalData=clinicalData,
+                                                            doubleView_3d=doubleView_3d,
+                                                            doubleView_2d=doubleView_2d,
                                                             enable_multibranch_ffr=args.enable_multibranch_ffr,
                                                             enable_multibranch_ifr=args.enable_multibranch_ifr,
+                                                            enable_clinicalData=args.enable_clinicalData,
+                                                            doubleViewInput=args.doubleViewInput,
+                                                            input3d=args.input3d,
+                                                            input2d=args.input2d,
                                                             scaler=scaler)
             if args.enable_multibranch_ffr and args.enable_multibranch_ifr:
                 predicted_labels, predicted_scores, predicted_FFRs, predicted_iFRs = returned_values
@@ -296,7 +377,12 @@ def main():
             
             if args.enable_explainability:
                 if args.explainability_mode == 'medcam':
-                    interpolate_dims = images_3d.shape[2:]
+                    if args.dataset3d and (not args.dataset2d):
+                        interpolate_dims = images_3d.shape[2:]
+                    elif (not args.dataset3d) and args.dataset2d:
+                        interpolate_dims = images_2d.shape[2:]
+                    else:
+                        raise NotImplementedError()
 
                     if args.distributed:
                         layer_attribution = model.module.get_attention_map()
@@ -307,23 +393,42 @@ def main():
                         
                     upsamp_attr_lgc = upsamp_attr_lgc.cpu().detach().numpy()
                     
-                    tot_images_3d_gradient.extend(upsamp_attr_lgc.tolist())
+                    if args.dataset3d and (not args.dataset2d):
+                        tot_images_3d_gradient.extend(upsamp_attr_lgc.tolist())
+                    elif (not args.dataset3d) and args.dataset2d:
+                        tot_images_2d_gradient.extend(upsamp_attr_lgc.tolist())
+                    else:
+                        raise NotImplementedError()
                     
                 elif args.explainability_mode == 'pytorchgradcambook':
-                    input_tensor = images_3d_clone
+                    if args.dataset3d and (not args.dataset2d):
+                        input_tensor = images_3d_clone
+                    elif (not args.dataset3d) and args.dataset2d:
+                        input_tensor = images_2d_clone
+                    else:
+                        raise NotImplementedError()
                     
                     # targets = specify the target to generate the Class Activation Maps
                     grayscale_cam = cam(input_tensor=input_tensor, targets=[ClassifierOutputTarget(1)], aug_smooth=True, eigen_smooth=True)
                     grayscale_cam = grayscale_cam.cpu().detach().numpy()
                     
-                    tot_images_3d_gradient.extend(grayscale_cam.tolist())
+                    if args.dataset3d and (not args.dataset2d):
+                        tot_images_3d_gradient.extend(grayscale_cam.tolist())
+                    elif (not args.dataset3d) and args.dataset2d:
+                        tot_images_2d_gradient.extend(grayscale_cam.tolist())
+                    else:
+                        raise NotImplementedError()
         
         if args.distributed:
             torch.distributed.barrier()
 
             if args.enable_explainability:
-                tot_images_3d_output = [None for _ in range(args.world_size)]
-                tot_images_3d_gradient_output = [None for _ in range(args.world_size)]
+                if args.dataset3d:
+                    tot_images_3d_output = [None for _ in range(args.world_size)]
+                    tot_images_3d_gradient_output = [None for _ in range(args.world_size)]
+                if args.dataset2d:
+                    tot_images_2d_output = [None for _ in range(args.world_size)]
+                    tot_images_2d_gradient_output = [None for _ in range(args.world_size)]
             tot_true_labels_output = [None for _ in range(args.world_size)]
             tot_true_FFRs_output = [None for _ in range(args.world_size)]
             tot_true_iFRs_output = [None for _ in range(args.world_size)]
@@ -336,9 +441,15 @@ def main():
 
             if args.enable_explainability:
                 print("Gathering volumes...")
-                torch.distributed.all_gather_object(tot_images_3d_output, tot_images_3d)
+                if args.dataset3d:
+                    torch.distributed.all_gather_object(tot_images_3d_output, tot_images_3d)
+                if args.dataset2d:
+                    torch.distributed.all_gather_object(tot_images_2d_output, tot_images_2d)
                 print("Gathering volume's gradients...")
-                torch.distributed.all_gather_object(tot_images_3d_gradient_output, tot_images_3d_gradient)
+                if args.dataset3d:
+                    torch.distributed.all_gather_object(tot_images_3d_gradient_output, tot_images_3d_gradient)
+                if args.dataset2d:
+                    torch.distributed.all_gather_object(tot_images_2d_gradient_output, tot_images_2d_gradient)
             torch.distributed.all_gather_object(tot_true_labels_output, tot_true_labels)
             torch.distributed.all_gather_object(tot_true_FFRs_output, tot_true_FFRs)
             torch.distributed.all_gather_object(tot_true_iFRs_output, tot_true_iFRs)
@@ -351,8 +462,12 @@ def main():
             torch.distributed.all_gather_object(tot_image_paths_output, tot_image_paths)
 
             if args.enable_explainability:
-                tot_images_3d = []
-                tot_images_3d_gradient = []
+                if args.dataset3d:
+                    tot_images_3d = []
+                    tot_images_3d_gradient = []
+                if args.dataset2d:
+                    tot_images_2d = []
+                    tot_images_2d_gradient = []
             tot_true_labels=[]
             tot_true_FFRs=[]
             tot_true_iFRs=[]
@@ -365,8 +480,12 @@ def main():
             tot_image_paths=[]
             for i in range(len(tot_true_labels_output)):
                 if args.enable_explainability:
-                    tot_images_3d.extend(tot_images_3d_output[i])
-                    tot_images_3d_gradient.extend(tot_images_3d_gradient_output[i])
+                    if args.dataset3d:
+                        tot_images_3d.extend(tot_images_3d_output[i])
+                        tot_images_3d_gradient.extend(tot_images_3d_gradient_output[i])
+                    if args.dataset2d:
+                        tot_images_2d.extend(tot_images_2d_output[i])
+                        tot_images_2d_gradient.extend(tot_images_2d_gradient_output[i])
                 tot_true_labels.extend(tot_true_labels_output[i])
                 tot_true_FFRs.extend(tot_true_FFRs_output[i])
                 tot_true_iFRs.extend(tot_true_iFRs_output[i])
@@ -471,39 +590,39 @@ def main():
 
             if args.start_tornado_server:
                 # Confusion Matrix
-                cm_image = utils.plot_confusion_matrix(tot_true_labels, tot_predicted_labels, ['negative', 'positive'], title="Confusion matrix "+split)
-                utils.plotImages(split + " " + str(epoch) + " epoch - Confusion Matrix", cm_image)
+                cm_figure, cm_image = utils.plot_confusion_matrix(tot_true_labels, tot_predicted_labels, ['negative', 'positive'], title="Confusion matrix "+split)
+                utils.plotImages(split + " " + str(epoch) + " epoch - Confusion Matrix", cm_figure, cm_image)
 
                 # ROC Curve
-                rocCurve_image = utils.calc_rocCurve(tot_true_labels, tot_predicted_scores)
-                utils.plotImages(split + " " + str(epoch) + " epoch - ROC Curve", rocCurve_image)
+                rocCurve_figure, rocCurve_image = utils.calc_rocCurve(tot_true_labels, tot_predicted_scores)
+                utils.plotImages(split + " " + str(epoch) + " epoch - ROC Curve", rocCurve_figure, rocCurve_image)
 
                 # Precision-Recall Curve
-                precisionRecallCurve_image = utils.calc_precisionRecallCurve(tot_true_labels, tot_predicted_scores)
-                utils.plotImages(split + " " + str(epoch) + " epoch - Precision-Recall Curve", precisionRecallCurve_image)
+                precisionRecallCurve_figure, precisionRecallCurve_image = utils.calc_precisionRecallCurve(tot_true_labels, tot_predicted_scores)
+                utils.plotImages(split + " " + str(epoch) + " epoch - Precision-Recall Curve", precisionRecallCurve_figure, precisionRecallCurve_image)
 
                 # Histograms FFR/iFR of FN and FP
-                histFFRs_image = utils.calc_FN_FP_histograms(tot_true_labels, tot_predicted_labels, tot_true_FFRs, "FFR", split)
-                utils.plotImages(split + " " + str(epoch) + " epoch - Histogram FFRs", histFFRs_image)
-                histiFRs_image = utils.calc_FN_FP_histograms(tot_true_labels, tot_predicted_labels, tot_true_iFRs, "iFR", split)
-                utils.plotImages(split + " " + str(epoch) + " epoch - Histogram iFRs", histiFRs_image)
+                histFFRs_figure, histFFRs_image = utils.calc_FN_FP_histograms(tot_true_labels, tot_predicted_labels, tot_true_FFRs, "FFR", split)
+                utils.plotImages(split + " " + str(epoch) + " epoch - Histogram FFRs", histFFRs_figure, histFFRs_image)
+                histiFRs_figure, histiFRs_image = utils.calc_FN_FP_histograms(tot_true_labels, tot_predicted_labels, tot_true_iFRs, "iFR", split)
+                utils.plotImages(split + " " + str(epoch) + " epoch - Histogram iFRs", histiFRs_figure, histiFRs_image)
 
                 # Error prediction per hospital
-                histPredictionErrorHospital = utils.calc_predictionErrorHospital_histogram(tot_true_labels, tot_predicted_labels, tot_image_paths, split)
-                utils.plotImages(split + " " + str(epoch) + " epoch - Histogram prediction error hospital", histPredictionErrorHospital)
+                histPredictionErrorHospital_figure, histPredictionErrorHospital_image = utils.calc_predictionErrorHospital_histogram(tot_true_labels, tot_predicted_labels, tot_image_paths, split)
+                utils.plotImages(split + " " + str(epoch) + " epoch - Histogram prediction error hospital", histPredictionErrorHospital_figure, histPredictionErrorHospital_image)
                 # Percentual error prediction per hospital
-                histPercentualPredictionErrorHospital = utils.calc_predictionPercentualErrorHospital_histogram(tot_true_labels, tot_predicted_labels, tot_image_paths, split)
-                utils.plotImages(split + " " + str(epoch) + " epoch - Histogram percentual prediction error hospital", histPercentualPredictionErrorHospital)
+                histPercentualPredictionErrorHospital_figure, histPercentualPredictionErrorHospital_image = utils.calc_predictionPercentualErrorHospital_histogram(tot_true_labels, tot_predicted_labels, tot_image_paths, split)
+                utils.plotImages(split + " " + str(epoch) + " epoch - Histogram percentual prediction error hospital", histPercentualPredictionErrorHospital_figure, histPercentualPredictionErrorHospital_image)
 
                 if args.enable_multibranch_ffr:
                     # Prediction FFR error: histogram of FFR values ​​with wrong prediction
-                    predictionError_FFRs = utils.calc_predictionError_histograms(tot_true_FFRs, tot_predicted_FFRs, args.multibranch_error_regression_threshold, "FFR", split)
-                    utils.plotImages(split + " " + str(epoch) + " epoch - Prediction error FFRs", predictionError_FFRs)
+                    predictionError_FFRs_figure, predictionError_FFRs_image = utils.calc_predictionError_histograms(tot_true_FFRs, tot_predicted_FFRs, args.multibranch_error_regression_threshold, "FFR", split)
+                    utils.plotImages(split + " " + str(epoch) + " epoch - Prediction error FFRs", predictionError_FFRs_figure, predictionError_FFRs_image)
 
                 if args.enable_multibranch_ifr:
                     # Prediction iFR error: histogram of iFR values ​​with wrong prediction
-                    predictionError_iFRs = utils.calc_predictionError_histograms(tot_true_iFRs, tot_predicted_iFRs, args.multibranch_error_regression_threshold, "iFR", split)
-                    utils.plotImages(split + " " + str(epoch) + " epoch - Prediction error iFRs", predictionError_iFRs)
+                    predictionError_iFRs_figure, predictionError_iFRs_image = utils.calc_predictionError_histograms(tot_true_iFRs, tot_predicted_iFRs, args.multibranch_error_regression_threshold, "iFR", split)
+                    utils.plotImages(split + " " + str(epoch) + " epoch - Prediction error iFRs", predictionError_iFRs_figure, predictionError_iFRs_image)
 
             # Print logs of error
             dict_other_info = {'image_path':tot_image_paths, 'ffr':tot_true_FFRs, 'ifr':tot_true_iFRs}
@@ -515,7 +634,34 @@ def main():
         
             # Save logs
             if args.saveLogs:
-                Saver.saveLogs(args.logdir, tot_true_labels, tot_predicted_labels, tot_predicted_scores, dict_other_info, split, epoch)
+                Saver.saveLogs(args.logdir/f'{split}_logs_{epoch:05d}_{str(args.split_path).split("_")[-2]}', tot_true_labels, tot_predicted_labels, tot_predicted_scores, dict_other_info, split, epoch, True)
+                
+                dict_general_info = {}
+                dict_general_info['accuracy_balanced'] = accuracy_balanced
+                dict_general_info['accuracy'] = accuracy
+                dict_general_info['precision'] = precision
+                dict_general_info['recall'] = recall
+                dict_general_info['specificity'] = specificity
+                dict_general_info['f1score'] = f1score
+                dict_general_info['auc'] = auc
+                dict_general_info['prc_score'] = prc_score
+                dict_general_info['brier_score'] = brier_score
+                dict_general_info['predictionAgreementRate'] = predictionAgreementRate
+                if args.enable_multibranch_ffr:
+                    dict_general_info['accuracy_FFRs'] = accuracy_FFRs
+                    dict_general_info['accuracyBalalnced_labels_FFRs'] = accuracyBalalnced_labels_FFRs
+                    dict_general_info['accuracy_labels_FFRs'] = accuracy_labels_FFRs
+                    dict_general_info['mae_FFRs'] = mae_FFRs
+                    dict_general_info['mse_FFRs'] = mse_FFRs
+                    dict_general_info['skewness_FFRs'] = skewness_FFRs
+                if args.enable_multibranch_ifr:
+                    dict_general_info['accuracy_iFRs'] = accuracy_iFRs
+                    dict_general_info['accuracyBalalnced_labels_iFRs'] = accuracyBalalnced_labels_iFRs
+                    dict_general_info['accuracy_labels_iFRs'] = accuracy_labels_iFRs
+                    dict_general_info['mae_iFRs'] = mae_iFRs
+                    dict_general_info['mse_iFRs'] = mse_iFRs
+                    dict_general_info['skewness_iFRs'] = skewness_iFRs
+                Saver.saveMetrics(args.logdir/f'{split}_metrics_{epoch:05d}_{str(args.split_path).split("_")[-2]}', dict_general_info, split, epoch, True)
             
             # Plot GradCAM
             if args.enable_explainability:
@@ -524,28 +670,48 @@ def main():
                 if not os.path.exists(args.logdir + '/export_fold' + str(args.num_fold)):
                     os.makedirs(args.logdir + '/export_fold' + str(args.num_fold))
                 
-                len_tot_images = len(tot_images_3d)
+                if args.dataset3d and (not args.dataset2d):
+                    len_tot_images = len(tot_images_3d)
+                elif (not args.dataset3d) and args.dataset2d:
+                    len_tot_images = len(tot_images_2d)
+                else:
+                    raise NotImplementedError()
                 
                 for i2 in tqdm(range(len_tot_images), desc='Explainability'):
-                    tot_images_3d[i2] = torch.tensor(tot_images_3d[i2])
-                    tot_images_3d_gradient[i2] = torch.tensor(tot_images_3d_gradient[i2])
-                    imgs=[]
-                    plt.clf()
-                    for i in range(tot_images_3d[i2].shape[1]):
+                    if args.dataset3d and (not args.dataset2d):
+                        tot_images_3d[i2] = torch.tensor(tot_images_3d[i2])
+                        tot_images_3d_gradient[i2] = torch.tensor(tot_images_3d_gradient[i2])
+                        imgs=[]
+                        plt.clf()
+                        for i in range(tot_images_3d[i2].shape[1]):
+                            if args.explainability_mode == 'medcam':
+                                plt.imshow(tot_images_3d[i2][0,i,:,:].cpu().squeeze().numpy(), cmap='gray')
+                                plt.imshow(scipy.ndimage.gaussian_filter(tot_images_3d_gradient[i2][0,i,:,:], sigma=10), interpolation='nearest', alpha=0.25)
+                            elif args.explainability_mode == 'pytorchgradcambook':
+                                plt.imshow(show_cam_on_image(tot_images_3d[i2][0,i,:,:].cpu().squeeze().numpy(), tot_images_3d_gradient[i2][0,i,:,:], use_rgb=True, colormap=cv2.COLORMAP_JET, image_weight=0.5))
+                            plt.axis('off')
+                            buf = io.BytesIO()
+                            plt.savefig(buf, format='jpeg')
+                            buf.seek(0)
+                            image = PIL.Image.open(buf)
+                            imgs.append(image)
+                            plt.clf()
+                            #plt.show()
+                        utils.saveGridImages(args.logdir + '/export_fold' + str(args.num_fold) + '/' + '_'.join(tot_image_paths[i2].replace('\\', '/').split('/')[-3:])[:-4], imgs, n_colonne=8)
+                    elif (not args.dataset3d) and args.dataset2d:
+                        tot_images_2d[i2] = torch.tensor(tot_images_2d[i2])
+                        tot_images_2d_gradient[i2] = torch.tensor(tot_images_2d_gradient[i2])
                         if args.explainability_mode == 'medcam':
-                            plt.imshow(tot_images_3d[i2][0,i,:,:].cpu().squeeze().numpy(), cmap='gray')
-                            plt.imshow(scipy.ndimage.gaussian_filter(tot_images_3d_gradient[i2][0,i,:,:], sigma=10), interpolation='nearest', alpha=0.25)
+                            plt.imshow(tot_images_2d[i2][0,:,:].cpu().squeeze().numpy(), cmap='gray')
+                            plt.imshow(scipy.ndimage.gaussian_filter(tot_images_2d_gradient[i2][0,:,:], sigma=10), interpolation='nearest', alpha=0.25)
                         elif args.explainability_mode == 'pytorchgradcambook':
-                            plt.imshow(show_cam_on_image(tot_images_3d[i2][0,i,:,:].cpu().squeeze().numpy(), tot_images_3d_gradient[i2][0,i,:,:], use_rgb=True, colormap=cv2.COLORMAP_JET, image_weight=0.5))
+                            plt.imshow(show_cam_on_image(tot_images_2d[i2][0,:,:].cpu().squeeze().numpy(), tot_images_2d_gradient[i2][0,:,:], use_rgb=True, colormap=cv2.COLORMAP_JET, image_weight=0.5))
                         plt.axis('off')
-                        buf = io.BytesIO()
-                        plt.savefig(buf, format='jpeg')
-                        buf.seek(0)
-                        image = PIL.Image.open(buf)
-                        imgs.append(image)
+                        plt.savefig(args.logdir + '/export_fold' + str(args.num_fold) + '/' + '_'.join(tot_image_paths[i2].replace('\\', '/').split('/')[-3:])[:-4] + '.jpg', format='jpeg')
                         plt.clf()
                         #plt.show()
-                    utils.saveGridImages(args.logdir + '/export_fold' + str(args.num_fold) + '/' + '_'.join(tot_image_paths[i2].replace('\\', '/').split('/')[-3:])[:-4], imgs, n_colonne=8)
+                    else:
+                        raise NotImplementedError()
 
     if args.distributed:
         torch.distributed.barrier()

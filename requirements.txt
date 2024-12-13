@@ -3,12 +3,14 @@ einops
 matplotlib
 ml-collections
 monai
-pytorch
-pytorch-cuda=11.7
 scikit-image
 scikit-learn
 tensorboard
 timm
+tqdm
+torch
 torchaudio
 torchvision
-tqdm
+medcam
+captum
+grad-cam
