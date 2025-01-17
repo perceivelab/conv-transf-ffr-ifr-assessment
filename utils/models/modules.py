@@ -1,3 +1,9 @@
+'''
+Copyright (c) R. Mineo, 2022-2024. All rights reserved.
+This code was developed by R. Mineo in collaboration with PerceiveLab and other contributors.
+For usage and licensing requests, please contact the owner.
+'''
+
 import torch 
 import torch.nn as nn
 import torch.nn.functional as F

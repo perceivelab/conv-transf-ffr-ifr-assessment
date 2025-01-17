@@ -1,3 +1,9 @@
+'''
+Copyright (c) R. Mineo, 2022-2024. All rights reserved.
+This code was developed by R. Mineo in collaboration with PerceiveLab and other contributors.
+For usage and licensing requests, please contact the owner.
+'''
+
 from multiprocessing.sharedctypes import Value
 import os
 os.environ['FOR_DISABLE_CONSOLE_CTRL_HANDLER'] = '1'
